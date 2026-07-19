@@ -239,6 +239,8 @@ Defaults unless stated: α=.05, two-tailed, power=.80, ratio=1.
 
 Rounding rule everywhere: per-arm/total n = `ceil` at the final step of each stage of the §6.15 pipeline (stages display their own ceils).
 
+> **⚑ R08 CORRECTION — forward-only, pending Krystal ratification** (2026-07-19, Claudisegna A.-L. Frame Assayer v01 / Claude Opus 4.8, orchestrator, resuming the usage-limited build). The pinned R08 value **197** above is a **citation error** and the shipped receipts use **199**. Evidence, verified two independent ways: (1) the parenthetical "pwr (196.22)" is exactly the *asymptotic* one-sample n = (z₀.₉₇₅+z₀.₈₀)²/d² = 196.222 → ceil 197 — i.e. the author took the asymptotic ceiling, not the exact noncentral-t that an actual `pwr.t.test(type="one.sample")` computes; (2) the exact value is 198.14 → ceil **199**, reproduced *without the engine* by the Guenther small-sample correction 196.222 + z₀.₉₇₅²/2 = 198.143, and *with* the engine by the same `solveNT1` machinery that reproduces pinned R06 (d=0.5 → 34) exactly. The original **197** is preserved in the table above for provenance; the engine's `runReceipts()` R08 row carries the correction inline. **Revert = restore 197 in both places.** This is the only pinned value changed from the frozen spec.
+
 ## 8. Wizard (guided mode)
 
 Four questions, plain language, big option cards. Routing is deterministic; every route states a one-sentence WHY ("Paired t: the same units appear in every condition, so each unit serves as its own control").
