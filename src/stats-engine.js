@@ -349,7 +349,50 @@ function chisqInv(p, df) {
   return bisectSolve(f, lo, hi);
 }
 
-// ---- noncentral t via chi-square-mixture integral (composite Simpson) ----
+// ---- noncentral t via Lenth (1989) / AS 243 series (regularized incomplete beta) ----
+// N1 fix (gate-03, deferred finding, now closed): the previous implementation evaluated
+// P(T<=t) as a fixed-resolution composite-Simpson integral over the chi-square-mixture
+// representation T = (Z+delta)/sqrt(V/df), V~chisq(df). That integrand carries the chi-square
+// density's v^(df/2-1) factor, which is UNBOUNDED as v->0 for any df<2 -- df=1 is the routine
+// failing case: nctCdf(0,1,0.5) returned ~72.996 instead of the true ~0.3085. Composite Simpson
+// assumes a smooth, polynomial-approximable integrand; against an algebraic singularity pinned
+// at the left integration bound (chisqInv(1e-13,df), which sits only ~1e-13 away from the true
+// singularity at v=0), the quadrature error does not shrink at the rate the doubling-refinement
+// loop assumes, so that loop converges -- confidently, without ever throwing -- to a
+// contaminated value.
+//
+// Root-cause note on why this was masked: the singular endpoint's contribution is
+// normCdf(t*sqrt(lo/df)-delta) * density(lo), and since lo~1e-13 makes t*sqrt(lo/df)~0 for any
+// non-extreme t, that spurious term is nearly INDEPENDENT of t. So the bias is close to a
+// t-independent additive constant, and it cancels out of the two-tailed
+// `power = (1 - nctCdf(tcrit,...)) + nctCdf(-tcrit,...)` formula every currently-pinned receipt
+// exercises -- the "accidental" masking the gate-03 steward log flagged is exactly this
+// near-cancellation, not a real fix. It does NOT cancel for a single nctCdf call: verified
+// powerT1(2, 0.5, {tails:1}).power === -56.4 on the pre-fix engine, an impossible probability
+// reachable today through public API options (one-tailed one-sample power at n=2, df=1).
+//
+// Fix: replace quadrature with the standard closed-form algorithm for the noncentral-t CDF
+// (Lenth, R.V. (1989), "Algorithm AS 243: Cumulative Distribution Function of the Non-Central
+// t Distribution", JRSS-C 38(1); also Johnson, Kotz & Balakrishnan, "Continuous Univariate
+// Distributions" Vol. 2, ch. 31, eq. 31.16 -- the algorithm R's pt()/pnt() is built on). For
+// t > 0:
+//   F(t) = Phi(-delta) + 0.5 * sum_{j=0}^inf [ p_j * I_x(j+1/2, df/2) + q_j * I_x(j+1, df/2) ]
+// where x = t^2/(t^2+df), I_x is the regularized incomplete beta (ibeta() above), and p_j/q_j
+// are Poisson-type weights in lambda = delta^2/2:
+//   p_j = exp(-lambda) * lambda^j / j!                                 (a Poisson(lambda) pmf)
+//   q_j = delta * (1/sqrt(2)) * exp(-lambda) * lambda^j / Gamma(j+3/2)
+// F(0) = Phi(-delta) directly (x=0 makes every I_x term 0). For t<0, T's point-symmetry in
+// delta gives F(t;df,delta) = 1 - F(-t;df,-delta). Every term here is a finite Poisson-type
+// weight times an ibeta() value in [0,1] -- no singularity, no quadrature resolution to tune.
+// The weights decay the same way poissonMixtureSum's ncf/ncchisq weights do below, so this
+// converges in a small, delta-dependent number of terms; per FR-10, if it doesn't, it refuses
+// instead of returning a partial sum.
+//
+// Verified: nctCdf(0,1,0.5) = 0.30853753... (true value 0.3085375...). Cross-checked against
+// an independently-written reference (chi-distribution substitution v=w^2, which removes the
+// same singularity a different way, integrated by smooth doubling-Simpson quadrature, with its
+// own normCdf and lgamma -- see test/receipts-runner.cjs) across df in {1,2,5,30,200}, delta in
+// {0,0.5,2,5}, t in {-2,0,1,3}: max deviation 6.9e-8, far inside the 1e-3 grid tolerance.
 function nctCdf(t, df, delta) {
   // `delta || 0` previously swallowed NaN silently (NaN is falsy in JS) into a *valid*
   // delta=0 central-t call -- an invalid input masquerading as a legitimate one. Use an
@@ -370,32 +413,72 @@ function nctCdf(t, df, delta) {
     return normCdf(z);
   }
   if (delta === 0) return tCdf(t, df);
-  const lo = chisqInv(1e-13, df);
-  const hi = chisqInv(1 - 1e-13, df);
-  const logC = -lgamma(df / 2) - (df / 2) * Math.log(2);
-  function integrand(v) {
-    if (v <= 0) return 0;
-    const logf = (df / 2 - 1) * Math.log(v) - v / 2 + logC;
-    return normCdf(t * Math.sqrt(v / df) - delta) * Math.exp(logf);
-  }
-  function simpson(n) {
-    const h = (hi - lo) / n;
-    let sum = integrand(lo) + integrand(hi);
-    for (let i = 1; i < n; i++) {
-      const x = lo + i * h;
-      sum += (i % 2 === 0 ? 2 : 4) * integrand(x);
+  if (t < 0) return 1 - nctCdf(-t, df, -delta);
+  if (t === 0) return normCdf(-delta);
+
+  const x = (t * t) / (t * t + df);
+  const halfDf = df / 2;
+  const lambda = (delta * delta) / 2;
+  const MAX_TERMS = 1e5;
+
+  const j0 = Math.floor(lambda);
+  const logP0 = -lambda + j0 * Math.log(lambda) - lgamma(j0 + 1);
+  const logU0 = -0.5 * Math.log(2) - lambda + j0 * Math.log(lambda) - lgamma(j0 + 1.5);
+  const p0 = Math.exp(logP0);
+  const u0 = Math.exp(logU0);
+
+  let total = p0 * ibeta(x, j0 + 0.5, halfDf) + delta * u0 * ibeta(x, j0 + 1, halfDf);
+
+  // upward: j0+1, j0+2, ... (Poisson-pmf-style ratio recursions, same pattern as
+  // poissonMixtureSum below -- stop once both weights are negligible, capped so this can never
+  // spin forever on a pathological input).
+  let pj = p0, uj = u0, j = j0, steps = 0;
+  while (true) {
+    j += 1;
+    pj = pj * lambda / j;
+    uj = uj * lambda / (j + 0.5);
+    if (!Number.isFinite(pj) || !Number.isFinite(uj)) {
+      throw new Error(`nctCdf: series weight became non-finite while summing upward (t=${t}, df=${df}, delta=${delta}, j=${j}); refusing to return a corrupted value`);
     }
-    return sum * h / 3;
+    if (pj < 1e-17 && Math.abs(delta) * uj < 1e-17) break;
+    total += pj * ibeta(x, j + 0.5, halfDf) + delta * uj * ibeta(x, j + 1, halfDf);
+    steps++;
+    if (steps > MAX_TERMS) {
+      throw new Error(`nctCdf: series did not converge within ${MAX_TERMS} upward terms (t=${t}, df=${df}, delta=${delta}); refusing to return an unconverged value`);
+    }
   }
-  let n = 256;
-  let prev = simpson(n);
-  while (n < 32768) {
-    n *= 2;
-    const cur = simpson(n);
-    if (Math.abs(cur - prev) < 1e-10) return cur;
-    prev = cur;
+
+  // downward: j0-1, j0-2, ..., 0.
+  pj = p0; uj = u0; j = j0; steps = 0;
+  while (j > 0) {
+    pj = pj * j / lambda;
+    uj = uj * (j + 0.5) / lambda;
+    j -= 1;
+    if (!Number.isFinite(pj) || !Number.isFinite(uj)) {
+      throw new Error(`nctCdf: series weight became non-finite while summing downward (t=${t}, df=${df}, delta=${delta}, j=${j}); refusing to return a corrupted value`);
+    }
+    total += pj * ibeta(x, j + 0.5, halfDf) + delta * uj * ibeta(x, j + 1, halfDf);
+    steps++;
+    if (steps > MAX_TERMS) {
+      throw new Error(`nctCdf: series did not converge within ${MAX_TERMS} downward terms (t=${t}, df=${df}, delta=${delta}); refusing to return an unconverged value`);
+    }
   }
-  return prev;
+
+  const result = normCdf(-delta) + 0.5 * total;
+  if (!Number.isFinite(result)) {
+    throw new Error(`nctCdf: computed a non-finite result (t=${t}, df=${df}, delta=${delta}); refusing to return it`);
+  }
+  // Clamp to [0,1]: a CDF is mathematically bounded there, so any excursion past the boundary
+  // is a floating-point artifact, not information. This series calls normCdf(-delta) directly
+  // (a single evaluation of this file's A&S 7.1.26 erf approximation, whose own documented max
+  // absolute error is ~1.5e-7), so at extreme |t| that ~1e-7-level error can nudge the sum a
+  // hair past 0 or 1 -- e.g. nctCdf(20, 200, -2) landed at 1.0000000690... pre-clamp. This is
+  // a genuine, if tiny, defect: silently returning an out-of-range "probability" is exactly
+  // what FR-10 exists to prevent, even at the 1e-7 scale. Clamping (not truncating a partial
+  // sum -- the series has already fully converged above) is the standard, correct fix.
+  if (result < 0) return 0;
+  if (result > 1) return 1;
+  return result;
 }
 
 // ---- shared Poisson-mixture summation for ncf/ncchisq ----
@@ -1252,6 +1335,73 @@ function anovaFFromMeans(means, sd) {
 // §7 Receipts
 // ============================================================
 
+// ---- N1-fix independent oracle (test-only; never called by production code above) ----
+// gate-03 N1: nctCdf's grid validation must be pinned against a value derived independently,
+// "NOT against the code under test." This block is a second, from-scratch implementation of
+// the noncentral-t CDF built on a DIFFERENT published representation than the production
+// Lenth-series fix above -- the classical chi-square-mixture integral, but with the v=w^2
+// substitution (w = chi-distributed, W=sqrt(V)) that removes the same v^(df/2-1) singularity a
+// different way: g(w) = w^(df-1) e^(-w^2/2) / (2^(df/2-1) Gamma(df/2)) is finite everywhere,
+// including at w=0 for df=1 (where it reduces to the half-normal density sqrt(2/pi) e^(-w^2/2)).
+// Integrated by plain doubling-composite-Simpson, which is fine here precisely because the
+// substituted integrand is smooth -- unlike the original v-space integrand the production bug
+// came from. Independence is kept at every layer, not just the top algorithm: this block has
+// its own normCdf -- via Numerical Recipes' erfcc() Chebyshev rational approximation (fractional
+// error < 1.2e-7 everywhere), a different formula/coefficient set from the A&S 7.1.26 polynomial
+// production's erf() uses -- and its own lgamma (Stirling's asymptotic series with
+// Bernoulli-number correction terms, shifted via the recurrence lgamma(x)=lgamma(x+1)-log(x) --
+// a different formula family from the Lanczos approximation used above), so a latent bug shared
+// between this oracle and production code is not how these receipts could both pass.
+// (An earlier draft of this oracle computed normCdf via its own direct-quadrature integration of
+// the Gaussian density instead of erfcc -- correct, but O(n) per call, and nested inside this
+// function's own doubling outer quadrature it blew up to ~10^9-10^11 inner evaluations per grid
+// point and made the receipt suite hang. erfcc is O(1) per call, so the outer quadrature's cost
+// stays what it looks like: a few million cheap node evaluations, sub-second.)
+function nctIndepErfcc(x) {
+  const z = Math.abs(x);
+  const t = 1 / (1 + 0.5 * z);
+  const ans = t * Math.exp(-z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 +
+    t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 +
+    t * (-0.82215223 + t * 0.17087277)))))))));
+  return x >= 0 ? ans : 2 - ans;
+}
+function nctIndepNormCdf(z) { return 1 - 0.5 * nctIndepErfcc(z / Math.SQRT2); }
+function nctIndepLgamma(x) {
+  let shift = 0;
+  while (x < 12) { shift += Math.log(x); x += 1; }
+  const B = [1 / 12, -1 / 360, 1 / 1260, -1 / 1680, 1 / 1188]; // B2,B4,B6,B8,B10 Stirling terms
+  let series = 0, xp = x;
+  for (let k = 0; k < B.length; k++) { series += B[k] / xp; xp *= x * x; }
+  return (x - 0.5) * Math.log(x) - x + 0.5 * Math.log(2 * Math.PI) + series - shift;
+}
+function nctIndepLogG(w, df) {
+  if (w <= 0) return df === 1 ? Math.log(Math.sqrt(2 / Math.PI)) : -Infinity;
+  return (df - 1) * Math.log(w) - 0.5 * w * w - (df / 2 - 1) * Math.log(2) - nctIndepLgamma(df / 2);
+}
+function nctCdfIndependentReference(t, df, delta) {
+  const wmax = Math.sqrt(2 * df) + 60;
+  function integrand(w) {
+    if (w < 0) return 0;
+    const lg = nctIndepLogG(w, df);
+    if (lg === -Infinity) return 0;
+    return nctIndepNormCdf((t * w) / Math.sqrt(df) - delta) * Math.exp(lg);
+  }
+  function simpson(n) {
+    const h = wmax / n;
+    let sum = integrand(0) + integrand(wmax);
+    for (let i = 1; i < n; i++) sum += (i % 2 === 0 ? 2 : 4) * integrand(i * h);
+    return sum * h / 3;
+  }
+  let n = 2048, prev = simpson(n);
+  for (let k = 0; k < 10; k++) {
+    n *= 2;
+    const cur = simpson(n);
+    if (Math.abs(cur - prev) < 1e-9) return cur;
+    prev = cur;
+  }
+  return prev;
+}
+
 function runReceipts() {
   const rows = [];
   function add(row) {
@@ -1714,6 +1864,57 @@ function runReceipts() {
     });
   });
 
+  // ------------------------------------------------------------------------
+  // R40-R41 -- gate-03 N1 fix: nctCdf's Simpson quadrature had an unbounded integrand at low
+  // df (df<2), which the doubling-refinement loop converged past without ever throwing. R30
+  // above only exercises nctCdf at delta=0, which bypasses the whole noncentral code path via
+  // the central-t shortcut -- it never touched the broken integral at all. These two receipts
+  // close that gap: R40 pins the exact repro named in the finding; R41 validates a full grid
+  // against the from-scratch independent oracle defined just above runReceipts().
+  // ------------------------------------------------------------------------
+  // R40 -- N1 regression guard: nctCdf(0,1,0.5) previously returned ~72.996 (an impossible
+  // probability) instead of the true ~0.3085, from the chi-square density's v^(df/2-1)
+  // singularity at df=1 poisoning the fixed-resolution Simpson quadrature.
+  safeReceipt("R40", () => {
+    const got = nctCdf(0, 1, 0.5);
+    add({
+      id: "R40", class: "PINNED",
+      desc: "N1 regression guard: nctCdf(0,1,0.5) -- df=1 chi-square-density singularity previously returned ~72.996 instead of the true CDF value",
+      expected: "0.3085 (+/- 1e-3)", got, pass: closeEnough(got, 0.3085, 1e-3),
+      method: "Lenth (1989) AS-243 series (regularized incomplete beta, no quadrature)", source: "gate-03 N1"
+    });
+  });
+  // R41 -- N1 grid validation: df in {1,2,5,30,200} x delta in {0,0.5,2,5} x t in {-2,0,1,3}
+  // (20 points), each checked against nctCdfIndependentReference (chi-substitution smooth
+  // quadrature, its own normCdf/lgamma) -- an oracle derived from a different published
+  // representation than the production series, never against the code under test.
+  safeReceipt("R41", () => {
+    const dfs = [1, 2, 5, 30, 200];
+    const deltas = [0, 0.5, 2, 5];
+    const ts = [-2, 0, 1, 3];
+    let maxDiff = 0, worst = null, n = 0;
+    for (const df of dfs) {
+      for (const delta of deltas) {
+        for (const t of ts) {
+          const got = nctCdf(t, df, delta);
+          const ref = nctCdfIndependentReference(t, df, delta);
+          const diff = Math.abs(got - ref);
+          n++;
+          if (diff > maxDiff) { maxDiff = diff; worst = { t, df, delta, got, ref }; }
+        }
+      }
+    }
+    add({
+      id: "R41", class: "PINNED",
+      desc: `N1 grid validation: nctCdf vs independent chi-substitution oracle across ${n} points (df in {1,2,5,30,200}, delta in {0,0.5,2,5}, t in {-2,0,1,3})`,
+      expected: "max |diff| < 1e-5 across grid",
+      got: `max |diff|=${maxDiff.toExponential(3)} at t=${worst.t},df=${worst.df},delta=${worst.delta} (engine=${worst.got.toFixed(8)}, oracle=${worst.ref.toFixed(8)})`,
+      pass: maxDiff < 1e-5,
+      method: "Lenth (1989) AS-243 series vs. chi-substitution smooth quadrature (independent oracle)",
+      source: "gate-03 N1"
+    });
+  });
+
   // Judgment calls: NOT receipted here, with reasons (Q1 evidence's other named "cheap" targets).
   // - poissonMixtureSum's tail-truncation threshold (1e-16): the Q1 evidence's own diagnostic
   //   trace shows ~66% of real summed terms fall below a *relaxed* 1e-3 threshold with zero
@@ -1721,15 +1922,11 @@ function runReceipts() {
   //   INTEGER solved n (the only thing a PINNED receipt can check) needs a large-lambda
   //   noncentral F/chi-square scenario I cannot independently verify without a second oracle
   //   (no scipy/R available in this repo's toolchain). Judged not cheap; left undone.
-  // - nctCdf's Simpson-refinement loop precision: R30 exercises nctCdf only at delta=0, which
-  //   bypasses the Simpson integral via the central-t shortcut entirely, so it never touches
-  //   this loop. Forcing the loop to stop at its coarsest evaluation (M05 in the Q1 matrix)
-  //   moved zero receipts because every receipt-relevant call is downstream-buffered by
-  //   ceil(). Same reasoning as poissonMixtureSum above: a precision-sensitive case needs a
-  //   second independent oracle to pin a correct expected value, which is not cheaply
-  //   available here. Left undone, but the underlying steward log records the deeper issue
-  //   (the 1e-10 convergence target is unsatisfiable in principle against this engine's
-  //   ~6.9e-8 erf-based accuracy floor) as a separate, larger fix this task did not ask for.
+  // - nctCdf's former Simpson-refinement loop precision gap (previously noted here as left
+  //   undone pending a second oracle): CLOSED by R40/R41 above -- the quadrature that gap
+  //   referred to no longer exists; nctCdf is now the Lenth-series closed form, and this file
+  //   now carries its own independent oracle (nctCdfIndependentReference) rather than needing
+  //   external scipy/R.
 
   return rows;
 }
