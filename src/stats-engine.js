@@ -134,6 +134,14 @@ function ibeta(x, a, b) {
 // legitimate large-df calls actually converge, and (2) if the series still fails to satisfy
 // its own convergence criterion within that (generous) cap, gser throws instead of silently
 // returning the unconverged partial sum.
+//
+// gate-03 round-2 Finding A: gcf (continued fraction, the large-x branch used by pgamma's
+// x >= a+1 dispatch) did NOT originally receive this scaling -- it kept the bare 400-iteration
+// cap. That was a real, if narrow, gap: gcf's worst case sits at the same x~=a boundary gser's
+// does (the pgamma dispatcher hands gcf everything just past that boundary), so a legitimate
+// large-df call landing there (e.g. chisqCdf(1000002.5, 1000000), a=500000) threw
+// non-convergence where the scaled gser sibling would have converged cleanly. gcf now gets the
+// identical scaled-cap formula, so the two branches genuinely match at last.
 function gser(a, x) {
   const EPS = 1e-14;
   if (!Number.isFinite(a) || a <= 0) {
@@ -167,13 +175,17 @@ function gser(a, x) {
 }
 
 function gcf(a, x) {
-  const ITMAX = 400, EPS = 1e-14, FPMIN = 1e-300;
+  const EPS = 1e-14, FPMIN = 1e-300;
   if (!Number.isFinite(a) || a <= 0) {
     throw new Error(`gcf: a must be a finite number > 0, got ${a}`);
   }
   if (!Number.isFinite(x)) {
     throw new Error(`gcf: x must be a finite number, got ${x}`);
   }
+  // Scaled cap, identical formula to gser's (F3 fix): the continued fraction's slow-convergence
+  // region sits at the same x~=a scale gser's series struggles at, so the same generous,
+  // hard-bounded scaling applies here too (gate-03 round-2 Finding A).
+  const ITMAX = Math.min(200000, Math.max(400, Math.ceil(20 * Math.sqrt(a)) + 1000));
   let b = x + 1 - a;
   let c = 1 / FPMIN;
   let d = 1 / b;
@@ -499,6 +511,9 @@ function poissonMixtureSum(lambda, termFn) {
   const logPoissonAtJ0 = -halfLambda + j0 * Math.log(halfLambda) - lgamma(j0 + 1);
   const w0 = Math.exp(logPoissonAtJ0);
   let total = w0 * termFn(j0);
+  if (!Number.isFinite(total)) {
+    throw new Error(`poissonMixtureSum: accumulated total became non-finite at the initial term (lambda=${lambda}, j=${j0}); refusing to return a corrupted value`);
+  }
   // upward
   let wj = w0, jj = j0 + 1, steps = 0;
   while (true) {
@@ -508,6 +523,12 @@ function poissonMixtureSum(lambda, termFn) {
     }
     if (wj < 1e-16) break;
     total += wj * termFn(jj);
+    // gate-03 round-2 Finding B: wj's finiteness is checked above, but termFn(jj) itself
+    // (or the product) could still be non-finite while wj stays finite, silently corrupting
+    // total with no throw. Check the accumulator itself, not just the weight.
+    if (!Number.isFinite(total)) {
+      throw new Error(`poissonMixtureSum: accumulated total became non-finite while summing upward (lambda=${lambda}, j=${jj}); refusing to return a corrupted value`);
+    }
     jj++;
     steps++;
     if (steps > MAX_TERMS) {
@@ -525,6 +546,10 @@ function poissonMixtureSum(lambda, termFn) {
     }
     if (wj < 1e-16) break;
     total += wj * termFn(jj);
+    // gate-03 round-2 Finding B: same total-accumulation guard, downward direction.
+    if (!Number.isFinite(total)) {
+      throw new Error(`poissonMixtureSum: accumulated total became non-finite while summing downward (lambda=${lambda}, j=${jj}); refusing to return a corrupted value`);
+    }
     jj--;
     steps++;
     if (steps > MAX_TERMS) {
@@ -1847,6 +1872,57 @@ function runReceipts() {
   });
 
   // ------------------------------------------------------------------------
+  // R42-R45 -- gate-03 round-2 Finding C: R34-R38 pinned only the named F1-F5 repro on each
+  // fixed primitive, not the sibling functions that inherit the same fixed guard. Round 2's
+  // steward spot-checked these siblings by hand and found them genuinely fixed already ("this
+  // is an evidence gap, not an unfixed runtime defect") -- these four receipts turn that
+  // spot-check into a permanent regression guard, same refusal-pinning pattern as R34-R38.
+  // ------------------------------------------------------------------------
+  // R42 -- mdeT1 sibling of R37's mdeT2: same bisectMde unreachable-target guard.
+  safeReceipt("R42", () => {
+    let threw = false, msg = "";
+    try { mdeT1(100, { power: 0.03 }); } catch (e) { threw = true; msg = e.message; }
+    add({
+      id: "R42", class: "PINNED", desc: "F4 sibling regression guard: mdeT1 refuses (throws) rather than fabricating a ceiling MDE when the target power is below the test's baseline power",
+      expected: "throws", got: threw ? `threw: ${msg}` : "did not throw (REGRESSION: would fabricate d~=0.01)",
+      pass: threw, method: "refusal check (FR-10)", source: "gate-03 round-2 Finding C (F4 sibling)"
+    });
+  });
+  // R43 -- solveNT2 sibling of R38's solveNProp2: same ratio<=0 guard, this time via
+  // n2FromRatio rather than the proportions objective directly.
+  safeReceipt("R43", () => {
+    let threw = false, msg = "";
+    try { solveNT2(0.5, { ratio: 0 }); } catch (e) { threw = true; msg = e.message; }
+    add({
+      id: "R43", class: "PINNED", desc: "F5 sibling regression guard: solveNT2 refuses (throws) rather than proceeding when ratio=0 poisons n2FromRatio",
+      expected: "throws", got: threw ? `threw: ${msg}` : "did not throw (REGRESSION: would compute a degenerate n2)",
+      pass: threw, method: "refusal check (FR-10)", source: "gate-03 round-2 Finding C (F5 sibling)"
+    });
+  });
+  // R44 -- tCdf sibling of the F2 df<=0 class (powerT2/R35 goes through this same guard
+  // indirectly; this pins the primitive directly).
+  safeReceipt("R44", () => {
+    let threw = false, msg = "";
+    try { tCdf(0, 0); } catch (e) { threw = true; msg = e.message; }
+    add({
+      id: "R44", class: "PINNED", desc: "F2 sibling regression guard: tCdf refuses (throws) rather than returning a value at df=0",
+      expected: "throws", got: threw ? `threw: ${msg}` : "did not throw (REGRESSION: would return a value at df<=0)",
+      pass: threw, method: "refusal check (FR-10)", source: "gate-03 round-2 Finding C (F2 sibling)"
+    });
+  });
+  // R45 -- ncfCdf sibling of R34's poissonMixtureSum negative-lambda guard (ncfCdf's
+  // noncentral branch delegates to poissonMixtureSum for lambda != 0).
+  safeReceipt("R45", () => {
+    let threw = false, msg = "";
+    try { ncfCdf(1, 2, 2, -1); } catch (e) { threw = true; msg = e.message; }
+    add({
+      id: "R45", class: "PINNED", desc: "F1 sibling regression guard: ncfCdf refuses (throws) rather than hanging/corrupting on negative lambda",
+      expected: "throws", got: threw ? `threw: ${msg}` : "did not throw (REGRESSION: would hang or corrupt)",
+      pass: threw, method: "refusal check (FR-10)", source: "gate-03 round-2 Finding C (F1 sibling)"
+    });
+  });
+
+  // ------------------------------------------------------------------------
   // R39 -- "where cheap" unconstrained-interior coverage (Q1 evidence file): solver tolerance.
   // bisectSolve's default tol=1e-12 was previously unconstrained by any receipt (relaxing it
   // nine orders of magnitude to 1e-3 moved zero receipts in the Q1 mutation matrix, because
@@ -1978,7 +2054,15 @@ const StatsEngine = {
   dFromMeans, dFromMeansSds, hFromProps, dzFromPaired, anovaFFromMeans,
 
   // receipts
-  runReceipts
+  runReceipts,
+
+  // gate-03 round-2 N1 grid-domain follow-up: nctCdfIndependentReference was previously a
+  // private helper only reachable from inside runReceipts' own closure (R41), so raters could
+  // reason about the grid's coverage but not execute adversarial (t, df, delta) triples of
+  // their own choosing against it. Exposed read-only, additively (no existing key removed or
+  // changed), same shelf as runReceipts -- both are receipts/verification machinery, not
+  // product-domain API surface.
+  nctCdfIndependentReference
 };
 
 if (typeof module !== "undefined" && module.exports) { module.exports = StatsEngine; }
