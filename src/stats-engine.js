@@ -421,6 +421,22 @@ function nctCdf(t, df, delta) {
     throw new Error(`nctCdf: t must be a finite number, got ${t}`);
   }
   if (df > 1e5) {
+    // ASAE gate-03 round 3 (2026-07-30): this branch switch (Lenth series below vs. the
+    // normal approximation here) produces a small, real, MEASURED discontinuity right at the
+    // df=1e5 threshold -- confirmed by direct execution, not just a theoretical concern:
+    //   t=1.6449, delta=0: step from df=100000 to df=100000.000001 = +1.39e-8
+    //   t=5,      delta=5: step at the same boundary                = -7.73e-10
+    //   t=10,     delta=5: step at the same boundary                = -9.09e-10
+    // roughly 1,000-100,000x larger than the surrounding within-branch steps (~1e-11 to
+    // 1e-15), because the two sides are two genuinely different numerical methods that only
+    // agree in the limit, not two evaluations of one continuous formula. ACCEPTED, not fixed:
+    // the absolute size (up to ~1.4e-8) is three orders of magnitude below R41's 1e-5 grid
+    // tolerance and below this file's own "typical" 6.9e-8 cross-check figure a few lines up,
+    // i.e. below the erf/normCdf accuracy floor this engine already operates at everywhere
+    // else -- no receipt or user-visible consequence has been found across an adversarial
+    // 668-probe sweep (see gate-03 round 3 raw receipts). Disclosed here on purpose so a
+    // future round finds this as a known, measured, accepted artifact instead of rediscovering
+    // it as if it were new.
     const z = (t * (1 - 1 / (4 * df)) - delta) / Math.sqrt(1 + (t * t) / (2 * df));
     return normCdf(z);
   }
@@ -1961,7 +1977,9 @@ function runReceipts() {
     });
   });
   // R41 -- N1 grid validation: df in {1,2,5,30,200} x delta in {0,0.5,2,5} x t in {-2,0,1,3}
-  // (20 points), each checked against nctCdfIndependentReference (chi-substitution smooth
+  // (80 points -- 5 dfs x 4 deltas x 4 ts; this comment previously said "20 points" and drifted
+  // out of sync with the loop below, caught by ASAE gate-03 round 3), each checked against
+  // nctCdfIndependentReference (chi-substitution smooth
   // quadrature, its own normCdf/lgamma) -- an oracle derived from a different published
   // representation than the production series, never against the code under test.
   safeReceipt("R41", () => {
