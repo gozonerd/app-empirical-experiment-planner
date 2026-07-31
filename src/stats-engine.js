@@ -429,14 +429,27 @@ function nctCdf(t, df, delta) {
     //   t=10,     delta=5: step at the same boundary                = -9.09e-10
     // roughly 1,000-100,000x larger than the surrounding within-branch steps (~1e-11 to
     // 1e-15), because the two sides are two genuinely different numerical methods that only
-    // agree in the limit, not two evaluations of one continuous formula. ACCEPTED, not fixed:
-    // the absolute size (up to ~1.4e-8) is three orders of magnitude below R41's 1e-5 grid
-    // tolerance and below this file's own "typical" 6.9e-8 cross-check figure a few lines up,
-    // i.e. below the erf/normCdf accuracy floor this engine already operates at everywhere
-    // else -- no receipt or user-visible consequence has been found across an adversarial
-    // 668-probe sweep (see gate-03 round 3 raw receipts). Disclosed here on purpose so a
-    // future round finds this as a known, measured, accepted artifact instead of rediscovering
-    // it as if it were new.
+    // agree in the limit, not two evaluations of one continuous formula.
+    //
+    // ASAE gate-03 round 4 (2026-07-30) CORRECTION: round 3's characterization above ("up to
+    // ~1.4e-8", "three orders of magnitude below R41's 1e-5 tolerance") was measured only over
+    // three points drawn from R41's own narrow tested range (|t|<=3, |delta|<=5) and does NOT
+    // hold globally -- R41's grid never exercises df>1e5 at all, so nothing here was actually
+    // covered by that receipt. A broader direct sweep (every t, delta in {-100,-50,-25,-10,-5,
+    // -2,0,2,5,10,25,50,100}, all 13x13=169 combinations, at the exact boundary df=100000 vs.
+    // df=100000.000001; zero throws) found the true worst case at t=-100, delta=-100:
+    //   step = -1.5437175567845074e-6  (lo=0.5000988767852538, hi=0.500097333067697)
+    // roughly 110x larger than round 3's disclosed ~1.4e-8, and only about 6.5x (roughly one
+    // order of magnitude, not three) below R41's 1e-5 grid tolerance. ACCEPTED, still not
+    // fixed: 1.54e-6 is still below R41's 1e-5 tolerance at every point measured, so no receipt
+    // currently fails and the underlying ACCEPT decision is unchanged -- but a real user's
+    // power-analysis inputs (large effect size, large noncentrality) can reach this wider
+    // range, so round 3's own quantitative claim about itself needed correcting rather than
+    // being repeated. No receipt or user-visible consequence has been found across this 169-
+    // point sweep or the adversarial 668-probe sweep round 3 ran (see gate-03 round 3 raw
+    // receipts). Disclosed here on purpose so a future round finds the corrected figure as a
+    // known, measured, accepted artifact instead of rediscovering the original claim's
+    // inaccuracy as if it were new.
     const z = (t * (1 - 1 / (4 * df)) - delta) / Math.sqrt(1 + (t * t) / (2 * df));
     return normCdf(z);
   }
