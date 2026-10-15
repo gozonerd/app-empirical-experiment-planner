@@ -7,7 +7,7 @@ An interactive planner for controlled empirical experiments with an honest **min
 - **Plan the design**: research question, hypotheses, IVs/DVs, auto-generated condition grid (declare two factors and it detects the factorial), a working seeded randomization-list generator (blocked, optionally stratified, CSV export), confound register, validity-threat checklists, analysis plan, and a one-click **preregistration export** in markdown.
 - **Power it exactly**: two-arm and paired tests for means and proportions, k-arm designs with multiplicity correction, omnibus ANOVA and χ², factorial main effects **and interactions**, non-inferiority and equivalence (TOST) modes, correlation, precision (CI-width) planning, cluster/design-effect and attrition adjustments — computed with exact noncentral t/F/χ² numerics, not normal-approximation shortcuts.
 - **Never asks you for an abstract effect size**: type the group means, proportions, or factorial cell means you actually expect, and it derives the effect sizes — including the interaction term, where naive budgeting fails worst.
-- **Validates itself in front of you**: a Receipts panel re-runs ~30 published reference cases (Cohen's tables, G*Power manual examples, identity checks) live in the page, pass/fail visible.
+- **Validates itself in front of you**: a Receipts panel re-runs 84 pinned receipts (Cohen's tables, G*Power manual examples, identity checks, and the regression guards from the engine's adversarial audit rounds) live in the page, pass/fail visible.
 
 ## The design principle
 
